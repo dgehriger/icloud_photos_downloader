@@ -50,6 +50,16 @@ class _DefaultConfig:
     skip_created_before: datetime.datetime | datetime.timedelta | None
     skip_created_after: datetime.datetime | datetime.timedelta | None
     skip_photos: bool
+    download_db: str | None
+    no_download_db: bool
+    redownload: bool
+    forget_downloaded: bool
+    db_export: str | None
+    db_vacuum: bool
+    db_seed: str | None
+    filter_created_after: datetime.datetime | datetime.timedelta | None
+    filter_created_before: datetime.datetime | datetime.timedelta | None
+    filter_ids: str | None
 
 
 @dataclass(kw_only=True)

@@ -257,6 +257,62 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="Don't download any photos (default: download all photos and videos)",
         action="store_true",
     )
+    cloned.add_argument(
+        "--download-db",
+        help="Path to download database for persistent tracking (default: auto-detected)",
+        default=None,
+        type=str,
+    )
+    cloned.add_argument(
+        "--no-download-db",
+        help="Disable download database entirely",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--redownload",
+        help="Ignore downloaded status in database and redownload assets",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--forget-downloaded",
+        help="Clear downloaded tombstones from database (use with filters)",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--db-export",
+        help="Export download database to CSV file",
+        default=None,
+        type=str,
+    )
+    cloned.add_argument(
+        "--db-vacuum",
+        help="Vacuum (compact) the download database",
+        action="store_true",
+    )
+    cloned.add_argument(
+        "--db-seed",
+        help="Seed database from existing download directory",
+        default=None,
+        type=str,
+    )
+    cloned.add_argument(
+        "--filter-created-after",
+        help="Filter forget-downloaded by assets created after date (ISO format)",
+        default=None,
+        type=parse_timestamp_or_timedelta_tz_error,
+    )
+    cloned.add_argument(
+        "--filter-created-before", 
+        help="Filter forget-downloaded by assets created before date (ISO format)",
+        default=None,
+        type=parse_timestamp_or_timedelta_tz_error,
+    )
+    cloned.add_argument(
+        "--filter-ids",
+        help="Filter forget-downloaded by asset IDs from CSV file",
+        default=None,
+        type=str,
+    )
     return cloned
 
 
@@ -473,6 +529,16 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         skip_created_before=user_ns.skip_created_before,
         skip_created_after=user_ns.skip_created_after,
         skip_photos=user_ns.skip_photos,
+        download_db=user_ns.download_db,
+        no_download_db=user_ns.no_download_db,
+        redownload=user_ns.redownload,
+        forget_downloaded=user_ns.forget_downloaded,
+        db_export=user_ns.db_export,
+        db_vacuum=user_ns.db_vacuum,
+        db_seed=user_ns.db_seed,
+        filter_created_after=user_ns.filter_created_after,
+        filter_created_before=user_ns.filter_created_before,
+        filter_ids=user_ns.filter_ids,
     )
 
 

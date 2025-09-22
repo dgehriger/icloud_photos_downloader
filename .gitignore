@@ -29,3 +29,7 @@ node_modules/
 .claude/
 
 *.har
+
+# UI project binaries (excluded from git)
+ui/bin/
+ui/src-tauri/target

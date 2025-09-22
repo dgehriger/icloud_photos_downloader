@@ -48,7 +48,8 @@ from icloudpd.filename_policies import build_filename_with_policies, create_file
 from icloudpd.log_level import LogLevel
 from icloudpd.mfa_provider import MFAProvider
 from icloudpd.password_provider import PasswordProvider
-from icloudpd.paths import local_download_path, remove_unicode_chars
+from icloudpd.paths import local_download_path, remove_unicode_chars, default_download_db_path
+from icloudpd.db import Database, now_iso
 from icloudpd.server import serve_app
 from icloudpd.status import Status, StatusExchange
 from icloudpd.string_helpers import parse_timestamp_or_timedelta, truncate_middle
@@ -433,6 +434,129 @@ def _process_all_users_once(
                 str(user_config.notification_script) if user_config.notification_script else None,
             )
 
+            # Set up download database
+            database = None
+            if not user_config.no_download_db:
+                from pathlib import Path
+                if user_config.download_db:
+                    db_path = Path(user_config.download_db)
+                else:
+                    db_path = default_download_db_path()
+                
+                # Handle legacy database migration for POSIX systems
+                legacy_path = Path.home() / '.config' / 'icloudpd' / 'downloads.db'
+                
+                try:
+                    # Ensure parent directory exists
+                    db_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Create database connection
+                    database = Database(db_path)
+                    
+                    # Migrate legacy database if applicable
+                    if not user_config.download_db and legacy_path != db_path:
+                        if database.migrate_legacy_db(legacy_path):
+                            logger.info(f"Migrated database from {legacy_path} to {db_path}")
+                    
+                    logger.debug(f"Using download database: {db_path}")
+                    
+                    # Handle utility operations
+                    if user_config.db_export:
+                        export_path = Path(user_config.db_export)
+                        database.export_csv(export_path)
+                        logger.info(f"Exported database to {export_path}")
+                        return 0
+                    
+                    if user_config.db_vacuum:
+                        database.vacuum()
+                        logger.info("Database vacuumed successfully")
+                        return 0
+                        
+                    if user_config.forget_downloaded:
+                        # Handle forget downloaded logic
+                        asset_ids = None
+                        if user_config.filter_ids:
+                            # Read asset IDs from CSV file
+                            import csv
+                            asset_ids = []
+                            with open(user_config.filter_ids, 'r', encoding='utf-8') as f:
+                                reader = csv.reader(f)
+                                for row in reader:
+                                    if row:  # Skip empty rows
+                                        asset_ids.append(row[0])
+                        
+                        created_after = None
+                        if user_config.filter_created_after:
+                            if isinstance(user_config.filter_created_after, datetime.datetime):
+                                created_after = user_config.filter_created_after.isoformat()
+                            elif isinstance(user_config.filter_created_after, datetime.timedelta):
+                                created_after = (datetime.datetime.now(datetime.timezone.utc) - user_config.filter_created_after).isoformat()
+                        
+                        created_before = None
+                        if user_config.filter_created_before:
+                            if isinstance(user_config.filter_created_before, datetime.datetime):
+                                created_before = user_config.filter_created_before.isoformat()
+                            elif isinstance(user_config.filter_created_before, datetime.timedelta):
+                                created_before = (datetime.datetime.now(datetime.timezone.utc) - user_config.filter_created_before).isoformat()
+                        
+                        count = database.forget_downloaded(asset_ids, created_after, created_before)
+                        logger.info(f"Forgot {count} downloaded records")
+                        return 0
+                        
+                    if user_config.db_seed:
+                        # Handle seeding from existing files
+                        seed_path = Path(user_config.db_seed)
+                        if not seed_path.exists():
+                            logger.error(f"Seed path does not exist: {seed_path}")
+                            return 1
+                        
+                        seeded_count = _seed_database_from_files(logger, database, seed_path)
+                        logger.info(f"Seeded database with {seeded_count} files from {seed_path}")
+                        return 0
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to initialize database at {db_path}: {e}")
+                    database = None
+            
+            # Add database parameter to passer and downloader
+            passer = partial(
+                where_builder,
+                logger,
+                user_config.skip_videos,
+                user_config.skip_created_before,
+                user_config.skip_created_after,
+                user_config.skip_photos,
+                filename_builder,
+                database,
+                user_config.redownload,
+                user_config.skip_created_before,
+            )
+
+            downloader = (
+                partial(
+                    download_builder,
+                    logger,
+                    user_config.folder_structure,
+                    user_config.directory,
+                    user_config.sizes,
+                    user_config.force_size,
+                    global_config.only_print_filenames,
+                    user_config.set_exif_datetime,
+                    user_config.skip_live_photos,
+                    user_config.live_photo_size,
+                    user_config.dry_run,
+                    user_config.file_match_policy,
+                    user_config.xmp_sidecar,
+                    lp_filename_generator,
+                    filename_builder,
+                    user_config.align_raw,
+                    database,
+                    user_config.library,
+                )
+                if user_config.directory is not None
+                else (lambda _s, _c, _p: False)
+            )
+
             # Use core_single_run since we've disabled watch at this level
             logger.info(f"Processing user: {user_config.username}")
             result = core_single_run(
@@ -519,20 +643,46 @@ def where_builder(
     skip_created_after: datetime.datetime | datetime.timedelta | None,
     skip_photos: bool,
     filename_builder: Callable[[PhotoAsset], str],
+    database: Database | None,
+    redownload: bool,
+    skip_policy_before: datetime.datetime | datetime.timedelta | None,
     photo: PhotoAsset,
 ) -> bool:
+    # Check database for already downloaded assets (tombstones)
+    if database and hasattr(photo, 'id') and photo.id:
+        existing_record = database.get(photo.id)
+        if existing_record and existing_record.status == 'downloaded' and not redownload:
+            filename = filename_builder(photo)
+            logger.debug(f"Skipping {filename}, already downloaded (asset_id: {photo.id})")
+            return False
+    
+    # Apply date-based policy skips and record them in database
+    if skip_created_before is not None:
+        temp_created_before = offset_to_datetime(skip_created_before)
+        if photo.created < temp_created_before:
+            filename = filename_builder(photo)
+            logger.debug(skip_created_before_message(temp_created_before, photo, filename_builder))
+            
+            # Record policy skip in database
+            if database and hasattr(photo, 'id') and photo.id:
+                try:
+                    database.upsert(
+                        asset_id=photo.id,
+                        status='skipped_by_policy',
+                        created_utc=photo.created.isoformat() if photo.created else None,
+                        icloud_filename=getattr(photo, 'filename', None),
+                        library_kind='personal',  # TODO: determine actual library kind
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to record policy skip in database: {e}")
+            return False
+
     if skip_videos and photo.item_type == AssetItemType.MOVIE:
         logger.debug(asset_type_skip_message(AssetItemType.IMAGE, filename_builder, photo))
         return False
     if skip_photos and photo.item_type == AssetItemType.IMAGE:
         logger.debug(asset_type_skip_message(AssetItemType.MOVIE, filename_builder, photo))
         return False
-
-    if skip_created_before is not None:
-        temp_created_before = offset_to_datetime(skip_created_before)
-        if photo.created < temp_created_before:
-            logger.debug(skip_created_before_message(temp_created_before, photo, filename_builder))
-            return False
 
     if skip_created_after is not None:
         temp_created_after = offset_to_datetime(skip_created_after)
@@ -577,6 +727,8 @@ def download_builder(
     lp_filename_generator: Callable[[str], str],
     filename_builder: Callable[[PhotoAsset], str],
     raw_policy: RawTreatmentPolicy,
+    database: Database | None,
+    library_kind: str,
     icloud: PyiCloudService,
     counter: Counter,
     photo: PhotoAsset,
@@ -726,6 +878,40 @@ def download_builder(
                     if not dry_run:
                         download.set_utime(download_path, created_date)
                     logger.info("Downloaded %s", truncated_path)
+                    
+                    # Record successful download in database
+                    if database and hasattr(photo, 'id') and photo.id:
+                        try:
+                            file_size = None
+                            if not dry_run and not only_print_filenames:
+                                try:
+                                    file_size = os.path.getsize(download_path)
+                                except OSError:
+                                    file_size = None
+                            
+                            # Get asset type safely
+                            asset_type = None
+                            if hasattr(photo, 'item_type') and photo.item_type:
+                                if hasattr(photo.item_type, 'value'):
+                                    asset_type = photo.item_type.value
+                                else:
+                                    asset_type = str(photo.item_type)
+                            
+                            database.upsert(
+                                asset_id=photo.id,
+                                master_record_id=getattr(photo, 'master_record_id', None),
+                                status='downloaded',
+                                icloud_filename=getattr(photo, 'filename', None),
+                                bytes=file_size,
+                                created_utc=photo.created.isoformat() if photo.created else None,
+                                original_checksum=getattr(photo, 'checksum', None),
+                                last_local_path=download_path if not dry_run and not only_print_filenames else None,
+                                library_kind=library_kind,
+                                asset_type=asset_type,
+                                last_attempt_utc=now_iso(),
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to record download in database: {e}")
 
         if xmp_sidecar:
             generate_xmp_file(logger, download_path, photo._asset_record, dry_run)
@@ -857,9 +1043,74 @@ def delete_photo_dry_run(
 
 def dump_responses(dumper: Callable[[Any], None], responses: List[Mapping[str, Any]]) -> None:
     # dump captured responses
-    for entry in responses:
-        # compose(logger.debug, compose(json.dumps, response_to_har))(response)
-        dumper(json.dumps(entry, indent=2))
+    for response in responses:
+        dumper(json.dumps(response, indent=4, sort_keys=True))
+
+
+def _seed_database_from_files(logger: logging.Logger, database: Database, seed_path) -> int:
+    """Seed database with files from existing download directory"""
+    from datetime import datetime, timezone
+    from pathlib import Path
+    import hashlib
+    
+    seed_path = Path(seed_path)
+    seeded_count = 0
+    
+    # Common image and video extensions
+    media_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
+                       '.mov', '.mp4', '.avi', '.m4v', '.mkv', '.webm',
+                       '.heic', '.heif', '.dng', '.cr2', '.nef', '.arw', '.orf'}
+    
+    logger.info(f"Scanning {seed_path} for media files...")
+    
+    for file_path in seed_path.rglob('*'):
+        if not file_path.is_file():
+            continue
+            
+        if file_path.suffix.lower() not in media_extensions:
+            continue
+            
+        try:
+            # Get file stats
+            stat = file_path.stat()
+            file_size = stat.st_size
+            modified_time = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+            
+            # Create a pseudo asset ID based on filename and size
+            # This is not ideal but needed for seeding existing files
+            pseudo_id = hashlib.md5(f"{file_path.name}_{file_size}".encode()).hexdigest()
+            
+            # Check if already exists
+            existing = database.get(pseudo_id)
+            if existing:
+                continue
+                
+            # Insert as downloaded
+            database.upsert(
+                asset_id=pseudo_id,
+                status='downloaded',
+                icloud_filename=file_path.name,
+                bytes=file_size,
+                created_utc=modified_time.isoformat(),
+                last_local_path=str(file_path),
+                library_kind='seeded',
+                asset_type='photo' if file_path.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', 
+                                                                  '.bmp', '.tiff', '.tif', '.heic', 
+                                                                  '.heif', '.dng', '.cr2', '.nef', 
+                                                                  '.arw', '.orf'} else 'video',
+                first_seen_utc=now_iso(),
+                last_seen_utc=now_iso(),
+            )
+            
+            seeded_count += 1
+            if seeded_count % 100 == 0:
+                logger.debug(f"Seeded {seeded_count} files...")
+                
+        except Exception as e:
+            logger.debug(f"Failed to seed file {file_path}: {e}")
+            continue
+    
+    return seeded_count
 
 
 def asset_type_skip_message(
