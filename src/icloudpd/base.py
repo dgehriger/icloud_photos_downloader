@@ -879,15 +879,14 @@ def download_builder(
                         download.set_utime(download_path, created_date)
                     logger.info("Downloaded %s", truncated_path)
                     
-                    # Record successful download in database
-                    if database and hasattr(photo, 'id') and photo.id:
+                    # Record successful download in database only if file was actually saved
+                    if database and hasattr(photo, 'id') and photo.id and not dry_run and not only_print_filenames:
                         try:
                             file_size = None
-                            if not dry_run and not only_print_filenames:
-                                try:
-                                    file_size = os.path.getsize(download_path)
-                                except OSError:
-                                    file_size = None
+                            try:
+                                file_size = os.path.getsize(download_path)
+                            except OSError:
+                                file_size = None
                             
                             # Get asset type safely
                             asset_type = None
@@ -905,7 +904,7 @@ def download_builder(
                                 bytes=file_size,
                                 created_utc=photo.created.isoformat() if photo.created else None,
                                 original_checksum=getattr(photo, 'checksum', None),
-                                last_local_path=download_path if not dry_run and not only_print_filenames else None,
+                                last_local_path=download_path,
                                 library_kind=library_kind,
                                 asset_type=asset_type,
                                 last_attempt_utc=now_iso(),
