@@ -3,6 +3,7 @@
 
 import datetime
 import getpass
+import hashlib
 import itertools
 import json
 import logging
@@ -90,6 +91,26 @@ class PhotoFilterResult(Enum):
     INCLUDE = "include"  # Photo should be processed
     SKIP = "skip"  # Photo should be skipped, but continue processing
     STOP = "stop"  # Photo should be skipped, and stop processing (early termination)
+
+
+def create_query_fingerprint(user_config) -> str:
+    """Create a fingerprint hash of query parameters that affect photo selection"""
+    # Include all parameters that affect which photos are downloaded
+    fingerprint_data = {
+        'skip_videos': user_config.skip_videos,
+        'skip_photos': user_config.skip_photos,
+        'skip_created_after': user_config.skip_created_after.isoformat() if user_config.skip_created_after else None,
+        'album': getattr(user_config, 'album', None),
+        'library': getattr(user_config, 'library', None),
+        'sizes': [size.value for size in user_config.sizes],
+        'file_match_policy': user_config.file_match_policy.value if user_config.file_match_policy else None,
+        'align_raw': user_config.align_raw.value if user_config.align_raw else None,
+        # Note: skip_created_before is intentionally excluded as it's what we're optimizing
+    }
+    
+    # Convert to canonical JSON and hash
+    canonical_json = json.dumps(fingerprint_data, sort_keys=True)
+    return hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()[:16]  # Use first 16 chars
 
 
 def build_filename_cleaner(keep_unicode: bool) -> Callable[[str], str]:
@@ -394,17 +415,8 @@ def _process_all_users_once(
                 user_config.file_match_policy, filename_cleaner
             )
 
-            # Set up function builders
-            passer = partial(
-                where_builder,
-                logger,
-                user_config.skip_videos,
-                user_config.skip_created_before,
-                user_config.skip_created_after,
-                user_config.skip_photos,
-                filename_builder,
-            )
-
+            # Set up function builders - passer will be created after database optimization
+            
             downloader = (
                 partial(
                     download_builder,
@@ -526,18 +538,40 @@ def _process_all_users_once(
                     logger.warning(f"Failed to initialize database at {db_path}: {e}")
                     database = None
             
-            # Add database parameter to passer and downloader
+            # OPTIMIZATION: Calculate optimal skip-created-before date based on download history
+            optimal_skip_created_before = user_config.skip_created_before
+            if database and user_config.skip_created_before:
+                query_fingerprint = create_query_fingerprint(user_config)
+                
+                # Convert timedelta to datetime if needed
+                original_cutoff_datetime = None
+                if user_config.skip_created_before:
+                    original_cutoff_datetime = offset_to_datetime(user_config.skip_created_before)
+                
+                calculated_cutoff = database.find_optimal_cutoff_date(
+                    query_fingerprint, 
+                    original_cutoff_datetime
+                )
+                if calculated_cutoff and calculated_cutoff != original_cutoff_datetime:
+                    optimal_skip_created_before = calculated_cutoff
+                    original_str = original_cutoff_datetime.strftime('%Y-%m-%d') if original_cutoff_datetime else "None"
+                    logger.info(
+                        f"Range optimization: Adjusted skip-created-before from {original_str} "
+                        f"to {optimal_skip_created_before.strftime('%Y-%m-%d')} based on download history"
+                    )
+            
+            # Create passer function with optimized cutoff date
             passer = partial(
                 where_builder,
                 logger,
                 user_config.skip_videos,
-                user_config.skip_created_before,
+                optimal_skip_created_before,  # Use optimized cutoff date
                 user_config.skip_created_after,
                 user_config.skip_photos,
                 filename_builder,
                 database,
                 user_config.redownload,
-                user_config.skip_created_before,
+                user_config.skip_created_before,  # For policy skip recording
             )
 
             downloader = (
@@ -577,6 +611,8 @@ def _process_all_users_once(
                 downloader,
                 notificator,
                 lp_filename_generator,
+                database,
+                optimal_skip_created_before if isinstance(optimal_skip_created_before, datetime.datetime) else None,
             )
 
             # If any user config fails and we're not in watch mode, return the error code
@@ -1146,6 +1182,8 @@ def core_single_run(
     downloader: Callable[[PyiCloudService, Counter, PhotoAsset], bool],
     notificator: Callable[[], None],
     lp_filename_generator: Callable[[str], str],
+    database: Database | None = None,
+    optimal_skip_created_before: datetime.datetime | None = None,
 ) -> int:
     """Download all iCloud photos to a local directory for a single execution (no watch loop)"""
 
@@ -1440,6 +1478,31 @@ def core_single_run(
                             message = f"All {photo_video_phrase} have been downloaded"
                             logger.info(message)
                             status_exchange.get_progress().photos_last_message = message
+                            
+                            # OPTIMIZATION: Record completed download range for future runs
+                            # Only record when files were actually saved (not dry-run or only-print-filenames)
+                            if (database and user_config.skip_created_before and photos_counter > 0 
+                                and not user_config.dry_run and not global_config.only_print_filenames):
+                                try:
+                                    query_fingerprint = create_query_fingerprint(user_config)
+                                    
+                                    # Calculate the actual range that was processed
+                                    range_start = optimal_skip_created_before or offset_to_datetime(user_config.skip_created_before)
+                                    range_end = datetime.datetime.now(get_localzone())
+                                    
+                                    if range_start:  # Ensure we have a valid start date
+                                        database.record_download_range(
+                                            query_fingerprint=query_fingerprint,
+                                            range_start_utc=range_start,
+                                            range_end_utc=range_end,
+                                            asset_count=photos_counter,
+                                            library_kind=library_object.library_type
+                                        )
+                                        
+                                        logger.debug(f"Recorded download range: {range_start.strftime('%Y-%m-%d')} to {range_end.strftime('%Y-%m-%d')} ({photos_counter} assets)")
+                                except Exception as e:
+                                    logger.debug(f"Failed to record download range: {e}")
+                        
                         status_exchange.get_progress().reset()
 
                     if user_config.auto_delete:

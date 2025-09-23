@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -27,9 +27,20 @@ CREATE TABLE IF NOT EXISTS downloads (
   last_attempt_utc    TEXT,
   last_error          TEXT
 );
+CREATE TABLE IF NOT EXISTS download_ranges (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  query_fingerprint   TEXT NOT NULL,           -- hash of query parameters
+  range_start_utc     TEXT NOT NULL,           -- ISO8601 UTC start of completed range
+  range_end_utc       TEXT NOT NULL,           -- ISO8601 UTC end of completed range
+  completed_utc       TEXT NOT NULL,           -- when this range was completed
+  asset_count         INTEGER NOT NULL,        -- number of assets in this range
+  library_kind        TEXT                     -- personal|shared
+);
 CREATE INDEX IF NOT EXISTS idx_downloads_master ON downloads(master_record_id);
 CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);
-PRAGMA user_version = 1;
+CREATE INDEX IF NOT EXISTS idx_ranges_fingerprint ON download_ranges(query_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_ranges_dates ON download_ranges(range_start_utc, range_end_utc);
+PRAGMA user_version = 2;
 PRAGMA journal_mode = WAL;
 """
 
@@ -52,6 +63,18 @@ class DownloadRow:
     last_seen_utc: str
     last_attempt_utc: Optional[str]
     last_error: Optional[str]
+
+
+@dataclass
+class DownloadRangeRow:
+    """Represents a row in the download_ranges table"""
+    id: int
+    query_fingerprint: str
+    range_start_utc: str
+    range_end_utc: str
+    completed_utc: str
+    asset_count: int
+    library_kind: Optional[str]
 
 
 def now_iso() -> str:
@@ -219,6 +242,98 @@ class Database:
         stats['db_size_bytes'] = self.path.stat().st_size if self.path.exists() else 0
         
         return stats
+
+    def record_download_range(
+        self,
+        query_fingerprint: str,
+        range_start_utc: datetime,
+        range_end_utc: datetime,
+        asset_count: int,
+        library_kind: Optional[str] = None
+    ) -> None:
+        """Record a completed download range"""
+        self.conn.execute("""
+            INSERT INTO download_ranges (
+                query_fingerprint, range_start_utc, range_end_utc, 
+                completed_utc, asset_count, library_kind
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            query_fingerprint,
+            range_start_utc.isoformat(),
+            range_end_utc.isoformat(),
+            datetime.now(timezone.utc).isoformat(),
+            asset_count,
+            library_kind
+        ))
+
+    def get_download_ranges(self, query_fingerprint: str) -> List[DownloadRangeRow]:
+        """Get all download ranges for a specific query fingerprint"""
+        cur = self.conn.execute("""
+            SELECT id, query_fingerprint, range_start_utc, range_end_utc, 
+                   completed_utc, asset_count, library_kind
+            FROM download_ranges 
+            WHERE query_fingerprint = ?
+            ORDER BY range_start_utc ASC
+        """, (query_fingerprint,))
+        
+        ranges = []
+        for row in cur.fetchall():
+            # Create DownloadRangeRow with only the fields we selected
+            ranges.append(DownloadRangeRow(
+                id=row[0],
+                query_fingerprint=row[1], 
+                range_start_utc=row[2],
+                range_end_utc=row[3],
+                completed_utc=row[4],
+                asset_count=row[5],
+                library_kind=row[6]
+            ))
+        return ranges
+
+    def find_optimal_cutoff_date(
+        self, 
+        query_fingerprint: str, 
+        original_cutoff: Optional[datetime] = None
+    ) -> Optional[datetime]:
+        """Find the optimal skip-created-before date based on completed ranges"""
+        ranges = self.get_download_ranges(query_fingerprint)
+        if not ranges:
+            return original_cutoff
+            
+        # Sort ranges by start date
+        ranges.sort(key=lambda r: r.range_start_utc)
+        
+        # Find the latest contiguous end date, working backwards from most recent
+        latest_end = None
+        
+        for range_row in reversed(ranges):
+            range_end = datetime.fromisoformat(range_row.range_end_utc.replace('Z', '+00:00'))
+            
+            if latest_end is None:
+                latest_end = range_end
+            else:
+                # Check if this range connects to our latest contiguous end
+                # Allow for 1-day gap for safety (timezone considerations)
+                gap_days = (latest_end - range_end).days
+                if gap_days <= 1:  # Ranges connect or overlap (with 1-day tolerance)
+                    # Update to earlier end date if this range starts earlier
+                    range_start = datetime.fromisoformat(range_row.range_start_utc.replace('Z', '+00:00'))
+                    if original_cutoff is None or range_start <= original_cutoff:
+                        latest_end = range_start
+                    else:
+                        break  # This range starts before our original cutoff
+                else:
+                    break  # Gap too large, stop here
+        
+        if latest_end and original_cutoff:
+            # Add 1-day safety margin and use the later of the two dates
+            safety_cutoff = latest_end + timedelta(days=1)
+            return max(safety_cutoff, original_cutoff)
+        elif latest_end:
+            # Add 1-day safety margin
+            return latest_end + timedelta(days=1)
+        else:
+            return original_cutoff
 
     def migrate_legacy_db(self, legacy_path: Path) -> bool:
         """Migrate from legacy database location if it exists"""
