@@ -11,7 +11,8 @@ import subprocess
 import sys
 import time
 import typing
-import urllib
+import urllib.parse
+from enum import Enum
 from functools import partial, singledispatch
 from logging import Logger
 from multiprocessing import freeze_support
@@ -82,6 +83,13 @@ from pyicloud_ipd.utils import (
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize
 
 freeze_support()  # fmt: skip # fixing tqdm on macos
+
+
+class PhotoFilterResult(Enum):
+    """Result of photo filtering by where_builder function"""
+    INCLUDE = "include"  # Photo should be processed
+    SKIP = "skip"  # Photo should be skipped, but continue processing
+    STOP = "stop"  # Photo should be skipped, and stop processing (early termination)
 
 
 def build_filename_cleaner(keep_unicode: bool) -> Callable[[str], str]:
@@ -647,16 +655,18 @@ def where_builder(
     redownload: bool,
     skip_policy_before: datetime.datetime | datetime.timedelta | None,
     photo: PhotoAsset,
-) -> bool:
+) -> PhotoFilterResult:
     # Check database for already downloaded assets (tombstones)
     if database and hasattr(photo, 'id') and photo.id:
         existing_record = database.get(photo.id)
         if existing_record and existing_record.status == 'downloaded' and not redownload:
             filename = filename_builder(photo)
             logger.debug(f"Skipping {filename}, already downloaded (asset_id: {photo.id})")
-            return False
+            return PhotoFilterResult.SKIP
     
     # Apply date-based policy skips and record them in database
+    # OPTIMIZATION: Since photos are enumerated from newest to oldest, once we hit 
+    # a photo older than skip_created_before, all subsequent photos will also be older
     if skip_created_before is not None:
         temp_created_before = offset_to_datetime(skip_created_before)
         if photo.created < temp_created_before:
@@ -675,22 +685,24 @@ def where_builder(
                     )
                 except Exception as e:
                     logger.debug(f"Failed to record policy skip in database: {e}")
-            return False
+            
+            # Return STOP to indicate early termination - all subsequent photos will also be older
+            return PhotoFilterResult.STOP
 
     if skip_videos and photo.item_type == AssetItemType.MOVIE:
         logger.debug(asset_type_skip_message(AssetItemType.IMAGE, filename_builder, photo))
-        return False
+        return PhotoFilterResult.SKIP
     if skip_photos and photo.item_type == AssetItemType.IMAGE:
         logger.debug(asset_type_skip_message(AssetItemType.MOVIE, filename_builder, photo))
-        return False
+        return PhotoFilterResult.SKIP
 
     if skip_created_after is not None:
         temp_created_after = offset_to_datetime(skip_created_after)
         if photo.created > temp_created_after:
             logger.debug(skip_created_after_message(temp_created_after, photo, filename_builder))
-            return False
+            return PhotoFilterResult.SKIP
 
-    return True
+    return PhotoFilterResult.INCLUDE
 
 
 def skip_created_before_message(
@@ -1130,7 +1142,7 @@ def core_single_run(
     password_providers_dict: Dict[
         PasswordProvider, Tuple[Callable[[str], str | None], Callable[[str, str], None]]
     ],
-    passer: Callable[[PhotoAsset], bool],
+    passer: Callable[[PhotoAsset], PhotoFilterResult],
     downloader: Callable[[PyiCloudService, Counter, PhotoAsset], bool],
     notificator: Callable[[], None],
     lp_filename_generator: Callable[[str], str],
@@ -1331,14 +1343,21 @@ def core_single_run(
                                 should_delete = False
 
                                 passer_result = passer(item)
-                                download_result = passer_result and download_photo(
+                                
+                                # Check for early termination due to skip-created-before optimization
+                                if passer_result == PhotoFilterResult.STOP:
+                                    logger.info("Reached skip-created-before cutoff date. Stopping enumeration (optimization).")
+                                    break
+                                
+                                should_process = passer_result == PhotoFilterResult.INCLUDE
+                                download_result = should_process and download_photo(
                                     consecutive_files_found, item
                                 )
                                 if download_result and user_config.delete_after_download:
                                     should_delete = True
 
                                 if (
-                                    passer_result
+                                    should_process
                                     and user_config.keep_icloud_recent_days is not None
                                 ):
                                     created_date = item.created.astimezone(get_localzone())
