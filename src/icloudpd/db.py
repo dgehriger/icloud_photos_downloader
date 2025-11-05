@@ -295,43 +295,49 @@ class Database:
         query_fingerprint: str, 
         original_cutoff: Optional[datetime] = None
     ) -> Optional[datetime]:
-        """Find the optimal skip-created-before date based on completed ranges"""
+        """Find the optimal skip-created-before date based on completed ranges
+        
+        The goal is to find the most recent date up to which we've successfully
+        downloaded all photos, so we can skip re-checking those photos.
+        """
         ranges = self.get_download_ranges(query_fingerprint)
         if not ranges:
             return original_cutoff
             
-        # Sort ranges by start date
+        # Sort ranges by start date (oldest first)
         ranges.sort(key=lambda r: r.range_start_utc)
         
-        # Find the latest contiguous end date, working backwards from most recent
-        latest_end = None
+        # Find the most recent contiguous coverage starting from the original cutoff
+        # We're looking for ranges that cover [original_cutoff, most_recent_end]
+        most_recent_end = None
         
-        for range_row in reversed(ranges):
+        for range_row in ranges:
+            range_start = datetime.fromisoformat(range_row.range_start_utc.replace('Z', '+00:00'))
             range_end = datetime.fromisoformat(range_row.range_end_utc.replace('Z', '+00:00'))
             
-            if latest_end is None:
-                latest_end = range_end
+            # Skip ranges that start after the original cutoff (they're for different queries)
+            if original_cutoff and range_start > original_cutoff + timedelta(days=1):
+                continue
+            
+            # This range covers from range_start to range_end
+            # If we haven't found any coverage yet, or this range extends our coverage
+            if most_recent_end is None:
+                most_recent_end = range_end
             else:
-                # Check if this range connects to our latest contiguous end
+                # Check if this range connects to our existing coverage
                 # Allow for 1-day gap for safety (timezone considerations)
-                gap_days = (latest_end - range_end).days
-                if gap_days <= 1:  # Ranges connect or overlap (with 1-day tolerance)
-                    # Update to earlier end date if this range starts earlier
-                    range_start = datetime.fromisoformat(range_row.range_start_utc.replace('Z', '+00:00'))
-                    if original_cutoff is None or range_start <= original_cutoff:
-                        latest_end = range_start
-                    else:
-                        break  # This range starts before our original cutoff
-                else:
-                    break  # Gap too large, stop here
+                gap_days = (range_start - most_recent_end).days
+                if gap_days <= 1:  # Ranges connect or overlap
+                    # Extend our coverage to the end of this range
+                    if range_end > most_recent_end:
+                        most_recent_end = range_end
+                # If there's a gap, we can't use this range to extend coverage
         
-        if latest_end and original_cutoff:
-            # Add 1-day safety margin and use the later of the two dates
-            safety_cutoff = latest_end + timedelta(days=1)
+        if most_recent_end and original_cutoff:
+            # Subtract 1-day safety margin to avoid missing photos at boundaries
+            safety_cutoff = most_recent_end - timedelta(days=1)
+            # Use the later of the safety cutoff or original cutoff
             return max(safety_cutoff, original_cutoff)
-        elif latest_end:
-            # Add 1-day safety margin
-            return latest_end + timedelta(days=1)
         else:
             return original_cutoff
 

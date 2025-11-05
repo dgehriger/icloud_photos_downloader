@@ -34,3 +34,4 @@ node_modules/
 ui/bin/
 ui/src-tauri/target
 reorg-script/logs
+task2-scripts
