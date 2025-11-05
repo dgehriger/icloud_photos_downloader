@@ -33,3 +33,4 @@ node_modules/
 # UI project binaries (excluded from git)
 ui/bin/
 ui/src-tauri/target
+reorg-script/logs
