@@ -1487,10 +1487,11 @@ def core_single_run(
                                     query_fingerprint = create_query_fingerprint(user_config)
                                     
                                     # Calculate the actual range that was processed
-                                    # range_start: where we started (optimized or original cutoff)
-                                    # range_end: the original cutoff date (not "now"), since that's the boundary we processed up to
-                                    range_start = optimal_skip_created_before or offset_to_datetime(user_config.skip_created_before)
-                                    range_end = offset_to_datetime(user_config.skip_created_before)
+                                    # When using skip_created_before, we download photos NEWER than the cutoff
+                                    # range_start: the original cutoff (oldest boundary we're confident about)
+                                    # range_end: now (the newest photos available at this moment)
+                                    range_start = offset_to_datetime(user_config.skip_created_before)
+                                    range_end = datetime.datetime.now(get_localzone())
                                     
                                     if range_start and range_end:  # Ensure we have valid dates
                                         database.record_download_range(
