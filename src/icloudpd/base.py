@@ -1489,9 +1489,10 @@ def core_single_run(
                                     # Calculate the actual range that was processed
                                     # When using skip_created_before, we download photos NEWER than the cutoff
                                     # range_start: the original cutoff (oldest boundary we're confident about)
-                                    # range_end: now (the newest photos available at this moment)
+                                    # range_end: start of today (midnight), not exact time, for cleaner day-boundary logic
                                     range_start = offset_to_datetime(user_config.skip_created_before)
-                                    range_end = datetime.datetime.now(get_localzone())
+                                    now = datetime.datetime.now(get_localzone())
+                                    range_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
                                     
                                     if range_start and range_end:  # Ensure we have valid dates
                                         database.record_download_range(
