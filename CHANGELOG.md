@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.32.3 (2026-05-29)
+
+- fix: restore 2FA for Apple's updated auth flow (2026+) [#1322]https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues/1322
+- fix: Update staticx to 0.14.2 with --no-build-isolation to resolve pkg_resources and SCons build failures on Python 3.13/Trixie
+- fix: Update Dockerfile.build-musl Alpine base from 3.19 to 3.23 to resolve Cargo lock file version 4 incompatibility
+
 ## 1.32.2 (2025-09-01)
 
 - fix: HTTP response content not captured for authentication and non-streaming requests [#1240](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues/1240)

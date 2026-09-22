@@ -147,7 +147,7 @@ jobs:
     - name: Run version
       uses: addnab/docker-run-action@v3
       with:
-        image: python:3.13-alpine3.19
+        image: python:3.13-alpine3.23
         shell: sh
         options: -v ${{ github.workspace }}:/work 
         run: >
@@ -548,7 +548,7 @@ jobs:
   
   build_macos:
     # earliest possible mac for better compatibility
-    runs-on: macos-13
+    runs-on: macos-14
     defaults:
       run:
         shell: bash
@@ -1148,7 +1148,7 @@ jobs:
       matrix: 
         prop: 
           - [
-            "macos-13",  # os
+            "macos-14",  # os
             "amd64",  # platform spec
           ]
           - [
@@ -2056,7 +2056,7 @@ jobs:
       matrix:  
         prop:  
           - [ 
-            "macos-13", 
+            "macos-14", 
             "amd64", 
             ] 
           - [ 
@@ -3347,7 +3347,7 @@ jobs:
       matrix: 
         prop:  
           - [ 
-            "macos-13", 
+            "macos-14", 
             "amd64", 
             ] 
           - [ 
@@ -3476,7 +3476,7 @@ jobs:
       matrix: 
         prop:  
           - [ 
-            "macos-13", 
+            "macos-14", 
             "amd64", 
             ] 
           - [ 

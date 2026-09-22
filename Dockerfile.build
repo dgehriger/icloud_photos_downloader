@@ -56,6 +56,11 @@ COPY src src/
 #   https://github.com/rust-lang/cargo/issues/8719#issuecomment-1207488994   
 # caching registry as a wa https://stackoverflow.com/a/60590697
 #--mount=type=cache,target=/root/.cargo/registry,sharing=shared \
+
+# --no-build-isolation required because staticx's build process uses SCons,
+# which must be present in the active venv at build time. Without this flag,
+# pip creates an isolated build environment where SCons is not available,
+# causing the staticx wheel build to fail.
 RUN \
     --mount=type=cache,target=/root/.cache/pip,sharing=shared \
     --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
@@ -63,9 +68,10 @@ RUN \
     . .venv/bin/activate && \
     echo "List pip cache..." && \
     pip3 cache list && \
+    python3 -m pip install --disable-pip-version-check --upgrade pip wheel && \
     python3 -m pip install --disable-pip-version-check -r requirements-pip.txt && \
     pip3 install --disable-pip-version-check . --group dev --group devlinux && \
-    BOOTLOADER_CC=musl-gcc pip3 install --disable-pip-version-check staticx==0.14.1
+    BOOTLOADER_CC=musl-gcc pip3 install --disable-pip-version-check --no-build-isolation staticx==0.14.2
 RUN \
     . .venv/bin/activate && \
     echo "Building binaries..." && \
