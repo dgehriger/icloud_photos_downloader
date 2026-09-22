@@ -538,28 +538,14 @@ def _process_all_users_once(
                     logger.warning(f"Failed to initialize database at {db_path}: {e}")
                     database = None
             
-            # OPTIMIZATION: Calculate optimal skip-created-before date based on download history
+            # The download database tracks each asset individually, and that is what
+            # makes runs incremental. An earlier version also moved the cutoff date
+            # forward to the last completed run. That was unsound: iCloud enumerates
+            # by creation date, so an asset added later carrying an older creation
+            # date fell outside the window and was never seen again. The cutoff now
+            # stays exactly where the caller put it.
             optimal_skip_created_before = user_config.skip_created_before
-            if database and user_config.skip_created_before:
-                query_fingerprint = create_query_fingerprint(user_config)
-                
-                # Convert timedelta to datetime if needed
-                original_cutoff_datetime = None
-                if user_config.skip_created_before:
-                    original_cutoff_datetime = offset_to_datetime(user_config.skip_created_before)
-                
-                calculated_cutoff = database.find_optimal_cutoff_date(
-                    query_fingerprint, 
-                    original_cutoff_datetime
-                )
-                if calculated_cutoff and calculated_cutoff != original_cutoff_datetime:
-                    optimal_skip_created_before = calculated_cutoff
-                    original_str = original_cutoff_datetime.strftime('%Y-%m-%d') if original_cutoff_datetime else "None"
-                    logger.info(
-                        f"Range optimization: Adjusted skip-created-before from {original_str} "
-                        f"to {optimal_skip_created_before.strftime('%Y-%m-%d')} based on download history"
-                    )
-            
+
             # Create passer function with optimized cutoff date
             passer = partial(
                 where_builder,
@@ -1479,34 +1465,7 @@ def core_single_run(
                             logger.info(message)
                             status_exchange.get_progress().photos_last_message = message
                             
-                            # OPTIMIZATION: Record completed download range for future runs
-                            # Only record when files were actually saved (not dry-run or only-print-filenames)
-                            if (database and user_config.skip_created_before and photos_counter > 0 
-                                and not user_config.dry_run and not global_config.only_print_filenames):
-                                try:
-                                    query_fingerprint = create_query_fingerprint(user_config)
-                                    
-                                    # Calculate the actual range that was processed
-                                    # When using skip_created_before, we download photos NEWER than the cutoff
-                                    # range_start: the original cutoff (oldest boundary we're confident about)
-                                    # range_end: start of today (midnight), not exact time, for cleaner day-boundary logic
-                                    range_start = offset_to_datetime(user_config.skip_created_before)
-                                    now = datetime.datetime.now(get_localzone())
-                                    range_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                                    
-                                    if range_start and range_end:  # Ensure we have valid dates
-                                        database.record_download_range(
-                                            query_fingerprint=query_fingerprint,
-                                            range_start_utc=range_start,
-                                            range_end_utc=range_end,
-                                            asset_count=photos_counter,
-                                            library_kind=library_object.library_type
-                                        )
-                                        
-                                        logger.debug(f"Recorded download range: {range_start.strftime('%Y-%m-%d')} to {range_end.strftime('%Y-%m-%d')} ({photos_counter} assets)")
-                                except Exception as e:
-                                    logger.debug(f"Failed to record download range: {e}")
-                        
+
                         status_exchange.get_progress().reset()
 
                     if user_config.auto_delete:
